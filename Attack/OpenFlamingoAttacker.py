@@ -1,6 +1,6 @@
 import torch
 from einops import repeat
-from Attack.utils import normalize, denormalize
+from Attack.utils import normalize, denormalize, normalize_noise
 
 class OpenFlamingoAttacker():
     def __init__(self, model, tokenizer, config = dict(), device = 'cuda:0', verbose = False):
@@ -10,12 +10,16 @@ class OpenFlamingoAttacker():
         self.device = device
         self.verbose = verbose 
 
+        self.H = 224
+        self.W = 224
+
         # visual attacker config
         self.epsilon = config["epsilon"] if "epsilon" in config else 2./255.
         self.num_iter_visual = config["num_iter_visual"] if "num_iter_visual" in config else 1000
         self.attack_lr = config["attack_lr"] if "attack_lr" in config else min(self.epsilon / 3, 2./255.)
         self.random_init = config["random_init"] if "random_init" in config else True
-        self.targeted_threshold = 0.3
+        self.targeted_threshold = 0.4
+        self.early_stop = True
 
         # textual attacker config
         self.num_iter_textual = config["num_iter_textual"] if "num_iter_textual" in config else 20
@@ -132,13 +136,16 @@ class OpenFlamingoAttacker():
         _, best_k_ids = torch.topk(scores, self.num_candidates)
         return best_k_ids.detach().cpu().numpy()
     
-    # perturb only the last image (query) of input images
-    # TODO: perturb only a patch
-    # return the adversarial noise
-    # only support prompt batch_size = 1
+    
+    # perturb the last image (query) of input images
+    # patch: perturb only a patch that is fixed in the top-left corner.
     # images: [N, c, h, w]
     # prompt and label should all be text
-    def visual_attack(self, images, prompt, label, targeted=False):
+    
+    # return the adversarial noise
+    # only support prompt batch_size = 1
+    def visual_attack(self, images, prompt, label, targeted=False, patch=None):
+
         input_ids, attention_mask, label_ids = self.get_prompt_input(prompt, label)
 
         vision_x_raw = denormalize(images).clone().to(self.device)
@@ -147,6 +154,11 @@ class OpenFlamingoAttacker():
         if self.random_init:
             vision_x_noise = vision_x_noise + self._random_noise(vision_x_noise)
 
+        patch_h, patch_w = self.H, self.W
+        if patch is not None:
+            patch_h, patch_w = patch.shape[1], patch.shape[2]
+            vision_x_noise[-1][:, :patch_h, :patch_w] += patch
+
         vision_x_adv_noise = torch.clamp(vision_x_noise + vision_x_raw, 0, 1) - vision_x_raw
 
         for _ in range(self.num_iter_visual + 1):
@@ -154,19 +166,21 @@ class OpenFlamingoAttacker():
             vision_x_adv = normalize(vision_x_raw + vision_x_adv_noise)
             loss = self.get_attack_loss(vision_x_adv, input_ids, attention_mask, label_ids)
 
-            if targeted and loss.item() < self.targeted_threshold:
+            if targeted and self.early_stop and loss.item() < self.targeted_threshold:
                 print(f'iter-{_}  loss: {loss.item()}')
                 break
             
             loss.backward()
 
             # use .data in order to change the value while remaining the grad
+            grad_sign = vision_x_adv_noise.grad[-1][:, :patch_h, :patch_w].sign()
             if targeted:
-                vision_x_adv_noise.data[-1] = (vision_x_adv_noise.data[-1] - self.attack_lr * vision_x_adv_noise.grad[-1].sign()).clamp(-self.epsilon, self.epsilon)
+                vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] = (vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] - self.attack_lr * grad_sign).clamp(-self.epsilon, self.epsilon)
             else:
-                vision_x_adv_noise.data[-1] = (vision_x_adv_noise.data[-1] + self.attack_lr * vision_x_adv_noise.grad[-1].sign()).clamp(-self.epsilon, self.epsilon)
-            vision_x_adv_noise.data[-1] = (vision_x_adv_noise.data[-1] + vision_x_raw.data[-1]).clamp(0, 1) - vision_x_raw.data[-1]
+                vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] = (vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] + self.attack_lr * grad_sign).clamp(-self.epsilon, self.epsilon)
+            vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] = (vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] + vision_x_raw.data[-1][:, :patch_h, :patch_w]).clamp(0, 1) - vision_x_raw.data[-1][:, :patch_h, :patch_w]
             vision_x_adv_noise.data[:-1] = 0
+            vision_x_adv_noise.data[-1][:, patch_h:, patch_w:] = 0
 
             # it will significantly accelerate the process if we accumulate the grad
             # vision_x_adv_noise.grad.zero_()
