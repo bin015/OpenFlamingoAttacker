@@ -23,6 +23,7 @@ class OpenFlamingoAttacker():
         self.attack_lr = config["attack_lr"] if "attack_lr" in config else min(self.epsilon / 3, 2./255.)
         self.random_init = config["random_init"] if "random_init" in config else True
         self.targeted_threshold = 0.4
+        self.untargeted_threshold = 10.
         self.early_stop = True
 
         # textual attacker config
@@ -30,6 +31,9 @@ class OpenFlamingoAttacker():
         self.num_token_to_flip = config["num_token_to_flip"] if "num_token_to_flip" in config else 5
         self.num_token_to_insert = config["num_token_to_insert"] if "num_token_to_insert" in config else 0
         self.num_grad_candidates = config["num_grad_candidates"] if "num_grad_candidates" in config else 50
+        self.use_special_token = config["use_special_token"] if "use_special_token" in config else False
+        self.use_all_token = config["use_all_token"] if "use_all_token" in config else True
+        self.token_length_limit = config["token_length_limit"] if "token_length_limit" in config else 1
         self.num_beams = config["num_beams"] if "num_beams" in config else 20
         self._get_vocabulary()
 
@@ -84,6 +88,12 @@ class OpenFlamingoAttacker():
     def get_attack_loss(self, vision_x, input_ids, attention_mask, label_ids, inputs_embeds=None):
         if len(vision_x.shape) == 4:
             vision_x = repeat(vision_x, 'N c h w -> b N T c h w', b=1, T=1)
+        elif len(vision_x.shape) == 6:
+            vision_x = vision_x
+        else:
+            raise ValueError(
+                f"The length of vision input shape should be 4(N c h w), or 6(b N T c h w). Receive vision_x shape {vision_x.shape}"
+            )
 
         loss = None
         if inputs_embeds != None:
@@ -112,34 +122,46 @@ class OpenFlamingoAttacker():
 
         single_token_vocabs = []
         single_token_vocabs_embedding = []
-        # single_token_id_to_vocab = dict()
-        # single_token_vocab_to_id = dict()
+        single_token = []
+        flip_token_id_to_token_ids = dict()
+        token_ids_to_flip_token_id = dict()
 
         cnt = 0
 
         for item in vocabs:
             tokens = self.tokenizer(item, return_tensors="pt", add_special_tokens=False).input_ids.to(self.device)
-            if tokens.shape[1] == 1 and filter_special_characters(item):
+            if tokens.shape[1] == 1 and filter_special_characters(item, self.use_special_token) and (self.use_all_token or len(item) <= self.token_length_limit):
 
                 single_token_vocabs.append(item)
+                single_token.append(tokens[0].item())
                 emb = self.model.lang_encoder.model.embed_tokens(tokens)
                 single_token_vocabs_embedding.append(emb)
 
-                # single_token_id_to_vocab[cnt] = item
-                # single_token_vocab_to_id[item] = cnt
+                flip_token_id_to_token_ids[cnt] = tokens[0][0].item()
+                token_ids_to_flip_token_id[tokens[0][0].item()] = cnt
 
                 cnt += 1
+
+        if "<unk>" not in single_token_vocabs:
+            tokens = self.tokenizer("<unk>", return_tensors="pt", add_special_tokens=False).input_ids.to(self.device)
+            single_token_vocabs.append("<unk>")
+            emb = self.model.lang_encoder.model.embed_tokens(tokens)
+            single_token_vocabs_embedding.append(emb)
+            flip_token_id_to_token_ids[cnt] = tokens[0][0].item()
+            token_ids_to_flip_token_id[tokens[0][0].item()] = cnt
+
+        print(f"textual attack search in {len(single_token_vocabs_embedding)} tokens")
 
         single_token_vocabs_embedding = torch.cat(single_token_vocabs_embedding, dim=1).squeeze()
 
         self.vocabs = single_token_vocabs
         self.embedding_matrix = single_token_vocabs_embedding.to(self.device)
-        # self.id_to_vocab = single_token_id_to_vocab
-        # self.vocab_to_id = single_token_vocab_to_id
+        self.flip_token_id_to_token_ids = flip_token_id_to_token_ids
+        self.token_ids_to_flip_token_id = token_ids_to_flip_token_id
 
     # get 'Question' and 'Answer' ids
     def get_qa_ids(self, input_ids):
-        equal_indices = torch.eq(input_ids, self.question_token_ids).squeeze()
+        equal_indices = torch.eq(input_ids, self.media_token_ids).squeeze()
         q_index = torch.nonzero(equal_indices, as_tuple=False)[-1].item()
 
         equal_indices = torch.eq(input_ids, self.answer_token_ids).squeeze()
@@ -167,19 +189,20 @@ class OpenFlamingoAttacker():
         new_flip_map_list = [raw_flip_map]
         for cand in candidates:
             new_flip_map = deepcopy(raw_flip_map)
-            new_flip_map[index] = cand
+            new_flip_map[index] = self.flip_token_id_to_token_ids[cand]
             new_flip_map_list.append(new_flip_map)
 
         return new_flip_map_list
 
     def hotflip_attack(self, grad, token_ids, increase_loss=False):
-        token_emb = self.embedding_matrix[token_ids]
+        token_id = self.token_ids_to_flip_token_id[token_ids]
+        token_emb = self.embedding_matrix[token_id]
         scores = ((self.embedding_matrix - token_emb) @ grad.T).squeeze(1)
 
         if not increase_loss:
             scores *= -1
 
-        _, best_k_ids = torch.topk(scores, self.num_candidates)
+        _, best_k_ids = torch.topk(scores, min(self.num_grad_candidates,len(scores)))
         return best_k_ids.detach().cpu().numpy()
     
     
@@ -190,6 +213,7 @@ class OpenFlamingoAttacker():
     # prompt and label should all be text   
     # return the adversarial noise
     # only support prompt batch_size = 1
+    # RTX3090 24G can only handle batch_size = 1
     def visual_attack(self, images, prompt, label, targeted=False, patch=None):
 
         input_ids, attention_mask, label_ids = self.get_prompt_input(prompt, label)
@@ -212,8 +236,8 @@ class OpenFlamingoAttacker():
             vision_x_adv = normalize(vision_x_raw + vision_x_adv_noise)
             loss = self.get_attack_loss(vision_x_adv, input_ids, attention_mask, label_ids)
 
-            if targeted and self.early_stop and loss.item() < self.targeted_threshold:
-                print(f'iter-{_}  loss: {loss.item()}')
+            if self.early_stop and (targeted and loss.item() < self.targeted_threshold) or (not targeted and loss.item() > self.untargeted_threshold):
+                # print(f'iter-{_}  loss: {loss.item()}')
                 break
             
             loss.backward()
@@ -226,7 +250,8 @@ class OpenFlamingoAttacker():
                 vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] = (vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] + self.attack_lr * grad_sign).clamp(-self.epsilon, self.epsilon)
             vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] = (vision_x_adv_noise.data[-1][:, :patch_h, :patch_w] + vision_x_raw.data[-1][:, :patch_h, :patch_w]).clamp(0, 1) - vision_x_raw.data[-1][:, :patch_h, :patch_w]
             vision_x_adv_noise.data[:-1] = 0
-            vision_x_adv_noise.data[-1][:, patch_h:, patch_w:] = 0
+            vision_x_adv_noise.data[-1][:, patch_h:, :] = 0
+            vision_x_adv_noise.data[-1][:, :, patch_w:] = 0
 
             # it will significantly accelerate the process if we accumulate the grad
             # vision_x_adv_noise.grad.zero_()
@@ -239,7 +264,15 @@ class OpenFlamingoAttacker():
                 print(f'iter-{_}  loss: {loss.item()}')
                 print(f'response: {response}')
 
+        # print('PGD completed!')
+        if self.verbose:
+            print('PGD completed!')
+            vision_x = normalize(vision_x_raw + vision_x_adv_noise)
+            response = self.generate(vision_x, prompt)
+            print(f'response: {response}')
+
         return vision_x_adv_noise.detach()
+
 
     # insert a few tokens in different positions and perturb through beam-search
     # it's better to insert less than 5 tokens because beam-search is extremely time-consuming
@@ -286,7 +319,7 @@ class OpenFlamingoAttacker():
         beams.append(beam)
         
         if self.verbose:
-                print(f'iter: 0  loss: {beams[0][1]:.6f}')
+            print(f'iter: 0 clean loss: {beams[0][1]:.6f}')
             
         for _ in range(self.num_iter_textual):
         
@@ -305,7 +338,7 @@ class OpenFlamingoAttacker():
                     loss.backward()
                 
                     tokens_grad = inputs_embeds.grad[:, token_to_flip_index, :]
-                    candidates = self.hotflip_attack(tokens_grad, adv_input_ids[0][token_to_flip_index], increase_loss=not targeted)
+                    candidates = self.hotflip_attack(tokens_grad, adv_input_ids[0][token_to_flip_index].item(), increase_loss=not targeted)
                 
                     new_flip_map_list = self.generate_flip_map(beam[0], token_to_flip_index, candidates)
                     for flip_map in new_flip_map_list:
@@ -323,8 +356,9 @@ class OpenFlamingoAttacker():
         adv_input_ids = self.flip(input_ids, beams[0][0])
         adv_prompt = self.tokenizer.decode(adv_input_ids[0][1:prompt_token_length])
 
-        print('Hotflip completed!')
+        # print('Hotflip completed!')
         if self.verbose:
+            print('Hotflip completed!')
             response = self.generate(vision_x, adv_prompt)
             print(f'response: {response}')
 

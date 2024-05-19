@@ -5,10 +5,12 @@ from torch.utils.data import Dataset
 from PIL import Image
 
 class VQA_RAD_Dataset(Dataset):
-    def __init__(self, json_path, image_folder_path, vision_processor, use_half_tensor = True, use_few_shot = False):
+    def __init__(self, json_path, image_folder_path, vision_processor, use_half_tensor = True, use_few_shot = False, use_adv_image = False):
 
         self.image_folder_path = image_folder_path
         self.vision_processor = vision_processor
+
+        self.use_adv_image = use_adv_image
 
         self.use_half_tensor = use_half_tensor
         self.use_few_shot = use_few_shot
@@ -19,6 +21,7 @@ class VQA_RAD_Dataset(Dataset):
                           "Answer the question. "
         
         # the same few-shot images as demonstrated in the Med-Flamingo demo
+        # all the questions are sampled from train split
         self.few_shot_image_folder = "../Data/VQA-RAD/few_shot_image/"
         self.few_shot_image_list = [
                                         'synpic50962.jpg',
@@ -30,18 +33,12 @@ class VQA_RAD_Dataset(Dataset):
                                     ]
         
         data = pd.read_json(json_path)
-
-        # check few shot question
-        # data = data[data["image_name"].isin(self.few_shot_image_list)]
-        # print(data)
         
         # use test data only
         data = data[data["phrase_type"].isin(["test_freeform", "test_para"])]
-
         data["answer"] = data["answer"].str.lower()
 
-        # remove those in few shot
-        self.data = data[~data["image_name"].isin(self.few_shot_image_list)]
+        self.data = data
 
         self.few_shot_prompt = None
         self.few_shot_image = None
@@ -75,8 +72,12 @@ class VQA_RAD_Dataset(Dataset):
         question  = sample['question']
         anwser = sample['answer']
         answer_type = sample['answer_type']
+        qid = str(sample['qid']) # to distinguish adversarial image
         
         image_path = self.image_folder_path + sample['image_name']
+        if self.use_adv_image:
+            image_path = self.image_folder_path + qid + "_adv_" + sample['image_name']
+
         image = self.vision_processor(Image.open(image_path)).unsqueeze(0)
 
         if self.use_half_tensor:
@@ -88,9 +89,10 @@ class VQA_RAD_Dataset(Dataset):
             prompt += self.few_shot_prompt
         
         item = {
-            'prompt': prompt + question + 'Answer:',
+            'qid': qid,
+            'prompt': prompt + "<image>Question: " + question + " Answer:",
             'question': question,
-            'image_path': sample['image_name'],       
+            'image_name': sample['image_name'],       
             'image': image,
             'label': anwser,
             'answer_type': answer_type,

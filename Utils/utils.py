@@ -21,9 +21,16 @@ def normalize_noise(tensor, std = OF_std):
     normalized_tensor = tensor / std
     return normalized_tensor
 
-def filter_special_characters(string):
-    pattern = re.compile(r'^[a-zA-Z !"#$%&\'()*+,-./:;<=>?@[\\\]^_`{|}~]*$')
+def filter_special_characters(string, use_special_token):
+    if use_special_token:
+        pattern = re.compile(r'^[ !"#$%&\'()*+,-./:;<=>?@[\\\]^_`{|}~]*$')
+    else:
+        pattern = re.compile(r'^[0-9a-zA-Z !"#$%&\'()*+,-./:;<=>?@[\\\]^_`{|}~]*$')
     if pattern.match(string):
         return True
     else:
         return False
+    
+def clean_generation(response):
+    response = response.replace('<unk>', '').replace('\n', '').strip()
+    return response
